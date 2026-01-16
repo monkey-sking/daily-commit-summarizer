@@ -1,0 +1,19 @@
+{
+  "name": "daily-commit-summarizer-local",
+  "version": "1.0.0",
+  "description": "Local version of daily-commit-summarizer for any git repo",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "minimist": "^1.2.8",
+    "tsx": "^4.7.1",
+    "typescript": "^5.3.3"
+  },
+  "devDependencies": {
+    "@types/minimist": "^1.2.5",
+    "@types/node": "^20.11.24"
+  }
+}
