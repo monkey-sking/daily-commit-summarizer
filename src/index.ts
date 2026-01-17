@@ -1,21 +1,44 @@
 import "dotenv/config";
 import { execSync } from "node:child_process";
-import https from "node:https";
+
 import minimist from "minimist";
 import path from "node:path";
+import OpenAI from "openai";
 import fs from "node:fs";
+import crypto from "node:crypto";
 
 // ------- Argument Parsing -------
 const args = minimist(process.argv.slice(2));
-const TARGET_REPO = args.repo ? path.resolve(args.repo) : process.cwd();
+const TARGET_DIR = args.dir ? path.resolve(args.dir) : null;
+const SINGLE_REPO = args.repo ? path.resolve(args.repo) : (TARGET_DIR ? null : process.cwd());
 const DAYS_BACK = args.days ? parseInt(args.days, 10) : 1;
+const SINCE_DATE = args.since || null; // e.g. "2025-04-01"
+const RECURSIVE_SCAN = args.recursive || args.r || false;
+const EXCLUDE_PATHS = args.exclude ? (Array.isArray(args.exclude) ? args.exclude : [args.exclude]) : [];
+
+// Owner whitelist for filtering third-party repos (based on remote URL)
+const GIT_OWNERS = (args.owners || process.env.GIT_OWNERS || "")
+  .split(",")
+  .map((s: string) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// Run mode: online (use AI) or offline (git log only)
+const RUN_MODE: "online" | "offline" = (args.mode || process.env.RUN_MODE || "online") as "online" | "offline";
+
+// Custom prompts file path
+const PROMPTS_FILE = args.prompts || process.env.PROMPTS_FILE || null;
+
+// Report filename format (supports: {{date}}, {{repo}})
+// Default: "{{date}}_{{repo}}.md"
+const REPORT_FILENAME_FORMAT = process.env.REPORT_FILENAME_FORMAT || "{{date}}_{{repo}}.md";
 
 // ------- Environment Variables -------
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || "https://api.openai.com";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
 // Default to basename of the target repo path if REPO env not set
-const REPO_NAME = process.env.REPO || path.basename(TARGET_REPO);
+// This will be set dynamically per repo in analyzeRepo
+// const REPO_NAME = process.env.REPO || path.basename(TARGET_REPO);
 const MODEL_NAME = process.env.MODEL_NAME || "gpt-4.1-mini";
 const PER_BRANCH_LIMIT = parseInt(process.env.PER_BRANCH_LIMIT || "200", 10);
 const DIFF_CHUNK_MAX_CHARS = parseInt(
@@ -24,22 +47,20 @@ const DIFF_CHUNK_MAX_CHARS = parseInt(
 );
 
 if (!OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY in .env");
-  process.exit(1);
+  console.warn("⚠️  Missing OPENAI_API_KEY in .env. AI summarization will be skipped (Offline Mode).");
 }
 
-if (!fs.existsSync(TARGET_REPO)) {
-  console.error(`❌ Repository path does not exist: ${TARGET_REPO}`);
+// Initial check for single repo mode
+if (!TARGET_DIR && SINGLE_REPO && !fs.existsSync(SINGLE_REPO)) {
+  console.error(`❌ Repository path does not exist: ${SINGLE_REPO}`);
   process.exit(1);
 }
-
-console.log(`📂 Analyzing repository: ${TARGET_REPO}`);
-console.log(`📅 Looking back ${DAYS_BACK} day(s)`);
 
 // ------- Utility Functions -------
+// The global sh function is no longer used directly for git operations within analyzeRepo
+// as analyzeRepo will define its own sh variant with the correct cwd.
 function sh(cmd: string) {
   return execSync(cmd, {
-    cwd: TARGET_REPO, // Execute commands in the target repo directory
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
   }).trim();
@@ -49,306 +70,231 @@ function safeArray<T>(xs: T[] | undefined | null) {
   return Array.isArray(xs) ? xs : [];
 }
 
-// ------- Git Operations -------
+// ------- Repository Discovery -------
 
-// Calculate 'since' date based on DAYS_BACK
-// git log --since accepts "2 days ago", "midnight", etc.
-// For robust local usage, let's use "midnight" logic relative to days back if possible,
-// or just specific timestamp. "midnight" is usually today 00:00.
-// If DAYS_BACK=1 (default), we want today's commits (since last midnight).
-// If DAYS_BACK=2, we want since yesterday midnight? Or just strict 24h?
-// The original script used "midnight". Let's stick to "midnight" if days=1,
-// otherwise use relative time like "${days} days ago".
-const since = DAYS_BACK === 1 ? "midnight" : `${DAYS_BACK} days ago`;
-const until = "now";
-
-// Ensure we have latest refs if it's a remote repo, but careful with auto-fetch in local dev
-// We'll skip auto-fetch for local tool unless explicitly requested, or just catch errors.
-// Generally in local tools, user manages state. But for summarizing "daily commits" usually implies remote work.
-// Let's try to fetch but don't fail if no remote.
-try {
-  sh(`git fetch --all --prune --tags`);
-} catch {
-  // ignore, might be no remote or offline
-}
-
-// Get remote branches
-let remoteBranches: string[] = [];
-try {
-  remoteBranches = sh(
-    `git for-each-ref --format="%(refname:short)" refs/remotes/origin | grep -v "^origin/HEAD$" || true`
-  )
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean);
-} catch (e) {
-  // ignore
-}
-
-if (remoteBranches.length === 0) {
-  console.warn("⚠️ No remote branches found. Checking local branches instead.");
-  try {
-    remoteBranches = sh(
-      `git for-each-ref --format="%(refname:short)" refs/heads`
-    )
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-  } catch (e) {
-    console.error("Error listing local branches:", e);
+/**
+ * Recursively discover all Git repositories under a directory
+ */
+function discoverGitRepos(baseDir: string, recursive: boolean, excludePaths: string[] = []): string[] {
+  const repos: string[] = [];
+  
+  function isExcluded(repoPath: string): boolean {
+    return excludePaths.some(excluded => {
+      const normalizedExclude = path.resolve(excluded);
+      return repoPath === normalizedExclude || repoPath.startsWith(normalizedExclude + path.sep);
+    });
   }
-}
-
-if (remoteBranches.length === 0) {
-  console.warn("⚠️ No branches found to analyze.");
-  process.exit(0);
-}
-
-type CommitMeta = {
-  sha: string;
-  title: string;
-  author: string;
-  url: string;
-  branches: string[];
-};
-
-const branchToCommits = new Map<string, string[]>();
-for (const rb of remoteBranches) {
-  try {
-    const list = sh(
-      `git log ${rb} --no-merges --since="${since}" --until="${until}" --pretty=format:%H --reverse || true`
-    )
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (list.length > 0) {
-      branchToCommits.set(rb, list.slice(-PER_BRANCH_LIMIT));
-    }
-  } catch (e) {
-    // ignore branch errors
-  }
-}
-
-const shaToBranches = new Map<string, Set<string>>();
-for (const [rb, shas] of branchToCommits) {
-  for (const sha of shas) {
-    if (!shaToBranches.has(sha)) shaToBranches.set(sha, new Set());
-    shaToBranches.get(sha)!.add(rb);
-  }
-}
-
-// Global view of commits roughly in order
-let allShasOrdered: string[] = [];
-try {
-  allShasOrdered = sh(
-    `git log --no-merges --since="${since}" --until="${until}" --all --pretty=format:%H --reverse || true`
-  )
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean);
-} catch (e) {
-  // fallback
-}
-
-const seen = new Set<string>();
-const commitShas = allShasOrdered.filter((sha) => {
-  if (seen.has(sha)) return false;
-  if (!shaToBranches.has(sha)) return false;
-  seen.add(sha);
-  return true;
-});
-
-if (commitShas.length === 0) {
-  console.log("📭 No valid commits found since " + since);
-  process.exit(0);
-}
-
-const commitMetas: CommitMeta[] = commitShas.map((sha) => {
-  const title = sh(`git show -s --format=%s ${sha}`);
-  const author = sh(`git show -s --format=%an ${sha}`);
-  // Try to guess URL if possible.
-  // If remote origin exists, parsing it could give a proper URL.
-  // For now we use the basic github convention or just placeholder if unknown.
-  let originUrl = "";
-  try {
-    originUrl = sh(`git remote get-url origin`);
-  } catch {}
-
-  let url = "";
-  if (originUrl.includes("github.com")) {
-    // cleaning git@github.com:org/repo.git -> org/repo
-    // or https://github.com/org/repo.git
-    let cleanRepo = originUrl
-      .replace("git@github.com:", "")
-      .replace("https://github.com/", "")
-      .replace(".git", "");
-    url = `https://github.com/${cleanRepo}/commit/${sha}`;
-  } else {
-    url = `(local commit ${sha.slice(0, 7)})`;
-  }
-
-  const branches = Array.from(shaToBranches.get(sha) || []).sort();
-  return { sha, title, author, url, branches };
-});
-
-console.log(`📝 Found ${commitMetas.length} commits to summarize...`);
-
-// ------- Diff Handling -------
-const FILE_EXCLUDES = [
-  ":!**/*.lock",
-  ":!**/dist/**",
-  ":!**/build/**",
-  ":!**/.next/**",
-  ":!**/.vite/**",
-  ":!**/out/**",
-  ":!**/coverage/**",
-  ":!package-lock.json",
-  ":!pnpm-lock.yaml",
-  ":!yarn.lock",
-  ":!**/*.min.*",
-  ":!**/node_modules/**",
-];
-
-function getParentSha(sha: string) {
-  const line = sh(`git rev-list --parents -n 1 ${sha} || true`);
-  const parts = line.split(" ").filter(Boolean);
-  return parts[1];
-}
-
-function getDiff(sha: string) {
-  const parent = getParentSha(sha);
-  // safe fallback for root commit
-  const base = parent || sh(`git hash-object -t tree /dev/null`);
-  const excludes = FILE_EXCLUDES.join(" ");
-  const diff = sh(
-    `git diff --unified=0 --minimal ${base} ${sha} -- . ${excludes} || true`
-  );
-  return diff;
-}
-
-function splitPatchByFile(patch: string): string[] {
-  if (!patch) return [];
-  const parts = patch.split(/^diff --git.*$/m);
-  return parts.map((p) => p.trim()).filter(Boolean);
-}
-
-function chunkBySize(parts: string[], limit = DIFF_CHUNK_MAX_CHARS): string[] {
-  const out: string[] = [];
-  let buf = "";
-  for (const p of parts) {
-    const candidate = buf ? `${buf}\n\n${p}` : p;
-    if (candidate.length > limit) {
-      if (buf) out.push(buf);
-      if (p.length > limit) {
-        for (let i = 0; i < p.length; i += limit) {
-          out.push(p.slice(i, i + limit));
+  
+  function scan(dir: string, depth: number) {
+    try {
+      const gitDir = path.join(dir, ".git");
+      if (fs.existsSync(gitDir) && fs.statSync(gitDir).isDirectory()) {
+        if (!isExcluded(dir)) {
+          repos.push(dir);
         }
-        buf = "";
-      } else {
-        buf = p;
+        // Don't scan subdirectories of a git repo (they would be submodules)
+        return;
       }
-    } else {
-      buf = candidate;
+      
+      // If not recursive and depth > 0, stop
+      if (!recursive && depth > 0) return;
+      
+      // Scan subdirectories
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        // Skip common non-project directories
+        if (entry.name.startsWith('.') || 
+            entry.name === 'node_modules' || 
+            entry.name === 'Intermediate' ||
+            entry.name === 'DerivedDataCache' ||
+            entry.name === 'Binaries' ||
+            entry.name === 'Build') continue;
+        
+        scan(path.join(dir, entry.name), depth + 1);
+      }
+    } catch (e) {
+      // Permission denied or other error, skip
     }
   }
-  if (buf) out.push(buf);
-  return out;
+  
+  // For non-recursive mode, only scan direct subdirectories
+  if (!recursive) {
+    try {
+      const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const subdir = path.join(baseDir, entry.name);
+        if (fs.existsSync(path.join(subdir, ".git"))) {
+          if (!isExcluded(subdir)) {
+            repos.push(subdir);
+          }
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  } else {
+    scan(baseDir, 0);
+  }
+  
+  return repos;
+}
+
+/**
+ * Extract owner from a Git remote URL
+ * Supports: GitHub, GitLab, Gitee, Bitbucket, etc.
+ */
+function extractOwnerFromUrl(remoteUrl: string): string | null {
+  if (!remoteUrl) return null;
+  
+  // Handle SSH format: git@github.com:owner/repo.git
+  const sshMatch = remoteUrl.match(/git@[^:]+:([^/]+)\//);
+  if (sshMatch) return sshMatch[1].toLowerCase();
+  
+  // Handle HTTPS format: https://github.com/owner/repo.git
+  const httpsMatch = remoteUrl.match(/https?:\/\/[^/]+\/([^/]+)\//);
+  if (httpsMatch) return httpsMatch[1].toLowerCase();
+  
+  return null;
+}
+
+/**
+ * Check if a repository is third-party based on remote URL owner
+ */
+function isThirdPartyRepo(repoPath: string, ownerWhitelist: string[]): { isThirdParty: boolean; reason?: string } {
+  // If no whitelist, don't filter
+  if (ownerWhitelist.length === 0) {
+    return { isThirdParty: false };
+  }
+  
+  try {
+    // Get remote origin URL
+    const remoteUrl = execSync(
+      `git remote get-url origin 2>/dev/null || true`,
+      { cwd: repoPath, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+    ).trim();
+    
+    // No remote = local repo, keep it
+    if (!remoteUrl) {
+      return { isThirdParty: false };
+    }
+    
+    const owner = extractOwnerFromUrl(remoteUrl);
+    if (!owner) {
+      // Can't parse URL, keep the repo
+      return { isThirdParty: false };
+    }
+    
+    // Check if owner is in whitelist
+    if (ownerWhitelist.includes(owner)) {
+      return { isThirdParty: false };
+    }
+    
+    return { 
+      isThirdParty: true, 
+      reason: `Owner: ${owner}` 
+    };
+  } catch (e) {
+    return { isThirdParty: false }; // On error, don't exclude
+  }
 }
 
 // ------- AI & Prompts -------
 
-type ChatPayload = {
-  model: string;
-  messages: { role: "system" | "user" | "assistant"; content: string }[];
-  temperature?: number;
-};
+// OpenAI Client Initialization
+const client = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+  baseURL: OPENAI_BASE_URL,
+});
 
 async function chat(prompt: string): Promise<string> {
-  console.log(`   > contacting LLM...`);
-  const payload: ChatPayload = {
-    model: MODEL_NAME,
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0.2,
-  };
-  const body = JSON.stringify(payload);
+  const maxRetries = 10;
+  let attempts = 0;
 
-  return new Promise((resolve, reject) => {
-    const url = new URL(OPENAI_BASE_URL);
-    // Handle paths properly if base url has path prefix
-    // Common OpenAI compatible endpoints might be /v1/chat/completions
-    // But original script used specific azure-like path: /openai/deployments/...
-    // START ADAPTATION: Use standard OpenAI path structure if not overridden,
-    // or try to respect base url fully.
-    // simpler: assume BASE_URL is just the host+prefix, and append chat/completions if missing?
-    // Let's stick closer to standard usage: ${BASE_URL}/v1/chat/completions if BASE_URL is just domain,
-    // Or if BASE_URL ends with /v1, use that.
-
-    // HOWEVER, the original script used a very specific Azure path:
-    // path: `/openai/deployments/${MODEL_NAME}/chat/completions?api-version=2024-12-01-preview`
-    // This suggests the user might be using Azure OpenAI.
-    // For general compatibility (standard OpenAI vs Azure), it's tricky without config.
-    // Let's try to detect or use a more standard path if it looks like standard OpenAI.
-
-    // For this local version, let's assume standard OpenAI interface usually: /v1/chat/completions
-    // UNLESS the base url already looks like an azure endpoint or the user wants the original azure logic.
-    // Given the prompt "run this project", I should probably keep the original logic IF the user is using the original repo's assumptions,
-    // BUT usually "OpenAI API Key" implies standard OpenAI. The original README said "Azure OpenAI".
-    // I will change this to standard /v1/chat/completions for broader compatibility, as it's the most common default.
-    // If user provides an Azure endpoint, they usually need to provide the full URL or we need to handle it.
-
-    // Let's use a simpler approach: construction complete URL from base.
-
-    let path = "/v1/chat/completions";
-    // If the base url contains 'openai.azure.com', we might need the azure format.
-    // But let's start with standard.
-
-    // Actually, looking at the user request, they just want to run it. I should probably support standard OpenAI style by default as it's "standard".
-    // I'll use the standard /v1/chat/completions which works for OpenAI, DeepSeek, etc.
-
-    const reqOptions = {
-      hostname: url.hostname,
-      port: url.port,
-      path: url.pathname === "/" ? path : url.pathname, // If base has path, use it? heuristic.
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Length": Buffer.byteLength(body),
-      },
-    };
-
-    // If base URL includes /v1 already, just append /chat/completions?
-    // Let's just make sure we form a valid URL.
-    if (OPENAI_BASE_URL.endsWith("/v1")) {
-      reqOptions.path = "/v1/chat/completions";
-    } else if (!OPENAI_BASE_URL.includes("chat/completions")) {
-      // If it's just https://api.openai.com, append /v1/chat/completions
-      reqOptions.path = "/v1/chat/completions";
-    } else {
-      // If user put full path in base url? Rare.
-    }
-
-    const req = https.request(reqOptions, (res) => {
-      let data = "";
-      res.on("data", (d) => (data += d));
-      res.on("end", () => {
-        try {
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            const json = JSON.parse(data);
-            const content = json?.choices?.[0]?.message?.content?.trim() || "";
-            resolve(content);
-          } else {
-            reject(new Error(`OpenAI HTTP ${res.statusCode}: ${data}`));
+  while (attempts < maxRetries) {
+      try {
+          return await new Promise(async (resolve, reject) => {
+              console.log(`   > contacting LLM...`);
+              try {
+                  const response = await client.chat.completions.create({
+                      model: MODEL_NAME,
+                      messages: [{ role: "user", content: prompt }],
+                      temperature: 0.2,
+                  });
+                  const content = response.choices[0]?.message?.content?.trim() || "";
+                  resolve(content);
+              } catch (e: any) {
+                  reject(e);
+              }
+          });
+      } catch (e: any) {
+          attempts++;
+          const errMsg = e.message || "";
+          if (errMsg.includes("limited") && errMsg.includes("wait")) {
+              const match = errMsg.match(/wait (\d+)s/);
+              const seconds = match ? parseInt(match[1], 10) : 3600;
+              console.warn(`\n⚠️  Rate limited (503). Waiting ${seconds}s before retry (Attempt ${attempts}/${maxRetries})...`);
+              // Wait requested seconds + 5s buffer
+              await new Promise(r => setTimeout(r, (seconds + 5) * 1000));
+              continue;
           }
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
+          if (attempts >= maxRetries) throw e;
+          
+          console.error(`   ❌ Chat error: ${errMsg}. Retrying in 10s...`);
+          await new Promise(r => setTimeout(r, 10000));
+      }
+  }
+  throw new Error("Max retries exceeded");
+}
+
+// ------- Prompt Configuration -------
+
+interface PromptConfig {
+  commitChunk?: string;
+  commitMerge?: string;
+  dailyMerge?: string;
+}
+
+const DEFAULT_PROMPTS: PromptConfig = {
+  commitChunk: `Please summarize this code change in **one sentence**.
+No analysis or explanation needed, just concisely describe "what changed".
+Example: "Fixed validation issue during user login" or "Added Excel export feature"
+
+Commit title for reference: {{title}}
+
+=== DIFF ===
+{{patch}}
+=== END ===`,
+  commitMerge: `Merge the following descriptions into **one sentence** summary:
+{{parts}}`,
+  dailyMerge: `Please consolidate the following commit summaries into a **daily development changelog (Chinese)**:
+# {{dateLabel}} Development Changelog ({{repoName}})
+1. Today's overview (max 5 items)
+2. Key changes by branch (module/impact, breaking changes)
+3. Cross-branch risks and rollback strategy
+4. Suggested testing checklist
+5. Other notes (refactoring/dependency updates/formatting only)
+
+=== Daily Commit Summaries BEGIN ===
+{{body}}
+=== Daily Commit Summaries END ===`
+};
+
+let customPrompts: PromptConfig = {};
+
+// Load custom prompts from file if specified
+if (PROMPTS_FILE && fs.existsSync(PROMPTS_FILE)) {
+  try {
+    customPrompts = JSON.parse(fs.readFileSync(PROMPTS_FILE, "utf8"));
+    console.log(`📝 Loaded custom prompts from: ${PROMPTS_FILE}`);
+  } catch (e) {
+    console.warn(`⚠️  Failed to load prompts file: ${PROMPTS_FILE}`);
+  }
+}
+
+function getPrompt(key: keyof PromptConfig): string {
+  return customPrompts[key] || DEFAULT_PROMPTS[key] || "";
 }
 
 function commitChunkPrompt(
@@ -357,46 +303,17 @@ function commitChunkPrompt(
   total: number,
   patch: string
 ) {
-  return `你是一名资深工程师与发布经理。以下是提交 ${meta.sha.slice(0, 7)}（${
-    meta.title
-  }）的 diff 片段（第 ${partIdx}/${total} 段），请用中文输出结构化摘要：
-
-提交信息：
-- SHA: ${meta.sha}
-- 标题: ${meta.title}
-- 作者: ${meta.author}
-- 分支: ${meta.branches.join(", ")}
-- 链接: ${meta.url}
-
-要求输出：
-1) 变更要点（面向工程师与产品）：列出此片段涉及的主要改动与意图
-2) 影响范围：模块/接口/关键文件
-3) 风险&回滚点
-4) 测试建议
-注意：仅基于当前片段，不要臆测；不要贴长代码；如果只是格式化/重命名也请明确指出。
-
-=== DIFF PART BEGIN ===
-${patch}
-=== DIFF PART END ===`;
+  return getPrompt("commitChunk")
+    .replace(/\{\{title\}\}/g, meta.title)
+    .replace(/\{\{patch\}\}/g, patch)
+    .replace(/\{\{partIdx\}\}/g, String(partIdx))
+    .replace(/\{\{total\}\}/g, String(total));
 }
 
 function commitMergePrompt(meta: CommitMeta, parts: string[]) {
-  const joined = parts.map((p, i) => `【片段${i + 1}】\n${p}`).join("\n\n");
-  return `下面是提交 ${meta.sha.slice(
-    0,
-    7
-  )} 的各片段小结，请合并为**单条提交**的最终摘要（中文），输出以下小节：
-- 变更概述（不超过5条要点）
-- 影响范围（模块/接口/配置）
-- 风险与回滚点
-- 测试建议
-- 面向用户的可见影响（如有）
-
-请避免重复、合并同类项，标注“可能不完整”当某些片段缺失或被截断。
-
-=== 片段小结集合 BEGIN ===
-${joined}
-=== 片段小结集合 END ===`;
+  const joined = parts.join("\n");
+  return getPrompt("commitMerge")
+    .replace(/\{\{parts\}\}/g, joined);
 }
 
 function dailyMergePrompt(
@@ -407,51 +324,336 @@ function dailyMergePrompt(
   const body = items
     .map(
       (it) =>
-        `[${it.meta.sha.slice(0, 7)}] ${it.meta.title} — ${
+        `[${it.meta.sha.slice(0, 7)}] ${it.meta.title} -- ${
           it.meta.author
-        } — ${it.meta.branches.join(", ")}
+        } -- ${it.meta.branches.join(", ")}
 ${it.summary}`
     )
     .join("\n\n---\n\n");
 
-  return `请将以下“当日各提交摘要”整合成**当日开发变更日报（中文）**，输出结构如下：
-# ${dateLabel} 开发变更日报（${repoName})
-1. 今日概览（不超过5条）
-2. **按分支**的关键改动清单（每条含模块/影响、是否潜在破坏性）
-3. 跨分支风险与回滚策略（如同一提交在多个分支、存在 cherry-pick/divergence）
-4. 建议测试与验证清单
-5. 其他备注（如重构/依赖升级/仅格式化）
-
-=== 当日提交摘要 BEGIN ===
-${body}
-=== 当日提交摘要 END ===`;
+  return getPrompt("dailyMerge")
+    .replace(/\{\{dateLabel\}\}/g, dateLabel)
+    .replace(/\{\{repoName\}\}/g, repoName)
+    .replace(/\{\{body\}\}/g, body);
 }
 
 // ------- Lark / Feishu Notification (Removed) -------
-// Previous implementation removed as per user request.
+type CommitMeta = {
+  sha: string;
+  date: string; // YYYY-MM-DD
+  title: string;
+  author: string;
+  url: string;
+  branches: string[];
+  stat?: string;
+};
 
-// ------- Local File Saving -------
-async function saveReportLocally(text: string, repoName: string) {
-  const reportsDir = path.join(process.cwd(), "reports");
-  if (!fs.existsSync(reportsDir)) {
-    fs.mkdirSync(reportsDir, { recursive: true });
+// ... (previous code) ...
+
+// ------- Core Logic: Analyze Single Repo -------
+// Returns list of processed commits with their summaries
+async function analyzeRepo(repoPath: string): Promise<{ repoName: string; repoOwner: string; results: { meta: CommitMeta; summary: string }[] } | null> {
+  const repoName = path.basename(repoPath);
+
+  // ------- Caching Logic -------
+  const CACHE_DIR = path.join(process.cwd(), ".cache");
+  if (!fs.existsSync(CACHE_DIR)) {
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+  
+  // Create a readable cache filename
+  const dateRange = SINCE_DATE ? `since-${SINCE_DATE}` : `days-${DAYS_BACK}`;
+  const sanitizedRepoName = repoName.replace(/[\/?:*"<>|]/g, "_");
+  const cacheFile = path.join(CACHE_DIR, `${sanitizedRepoName}_${dateRange}.json`);
+
+  // Try loading from cache (partial or complete)
+  let cachedResults: { meta: CommitMeta; summary: string }[] = [];
+  let cachedShas = new Set<string>();
+  
+  if (fs.existsSync(cacheFile)) {
+      try {
+          const cachedData = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+          if (cachedData && cachedData.repoName === repoName && Array.isArray(cachedData.results)) {
+              // Only load results that don't look like errors
+              cachedResults = cachedData.results.filter((r: { summary: string }) => 
+                !r.summary.includes("Failed") && 
+                !r.summary.includes("limited") && 
+                !r.summary.includes("503") &&
+                !r.summary.includes("摘要为空")
+              );
+              cachedShas = new Set(cachedResults.map(r => r.meta.sha));
+              console.log(`\n🔄 [Cache] Found ${cachedResults.length} valid cached commits for: ${repoName}`);
+          }
+      } catch (e) {
+          console.warn(`   (Cache file corrupted, ignoring: ${cacheFile})`);
+      }
   }
 
-  const dateStr = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
-  const sanitizedRepoName = repoName.replace(/[^a-zA-Z0-9-_]/g, "_");
-  const filename = `daily-summary-${sanitizedRepoName}-${dateStr}.md`;
-  const filePath = path.join(reportsDir, filename);
+  console.log(`\n📂 Analyzing repository: ${repoPath}`);
+  if (SINCE_DATE) {
+    console.log(`📅 Looking back since ${SINCE_DATE}`);
+  } else {
+    console.log(`📅 Looking back ${DAYS_BACK} day(s)`);
+  }
 
-  fs.writeFileSync(filePath, text, "utf8");
-  console.log(`\n✅ Daily report saved to: ${filePath}`);
-}
+  // Local sh helper for this repo
+  const runGit = (cmd: string) => execSync(cmd, { cwd: repoPath, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 10 * 1024 * 1024 }).trim();
 
-// ------- Main Execution Flow -------
-(async () => {
-  const perCommitFinal: { meta: CommitMeta; summary: string }[] = [];
+  // 1. Check if it's a git repo
+  if (!fs.existsSync(path.join(repoPath, ".git"))) {
+    console.log(`   (Skipping: not a git repository)`);
+    return null;
+  }
+
+  // Get repo owner from remote url
+  let repoOwner = "";
+  try {
+    const remoteUrl = execSync("git remote get-url origin || true", { cwd: repoPath, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    if (remoteUrl) repoOwner = extractOwnerFromUrl(remoteUrl) || "";
+  } catch (e) {}
+
+  // ------- Git Operations -------
+
+  // Calculate 'since' date based on DAYS_BACK
+  const since = SINCE_DATE ? SINCE_DATE : (DAYS_BACK === 1 ? "midnight" : `${DAYS_BACK} days ago`);
+  const until = "now";
+
+  try {
+    runGit(`git fetch --all --prune --tags`);
+  } catch {
+    // ignore, might be no remote or offline
+  }
+
+  // Get remote branches
+  let remoteBranches: string[] = [];
+  try {
+    remoteBranches = runGit(
+      `git for-each-ref --format="%(refname:short)" refs/remotes/origin | grep -v "^origin/HEAD$" || true`
+    )
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } catch (e) {
+    // ignore
+  }
+
+  if (remoteBranches.length === 0) {
+    console.warn("⚠️ No remote branches found. Checking local branches instead.");
+    try {
+      remoteBranches = runGit(
+        `git for-each-ref --format="%(refname:short)" refs/heads`
+      )
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } catch (e) {
+      console.error("Error listing local branches:", e);
+    }
+  }
+
+  if (remoteBranches.length === 0) {
+    console.warn("⚠️ No branches found to analyze.");
+    return null;
+  }
+
+  const branchToCommits = new Map<string, string[]>();
+  for (const rb of remoteBranches) {
+    try {
+      const list = runGit(
+        `git log ${rb} --no-merges --since="${since}" --until="${until}" --pretty=format:%H --reverse || true`
+      )
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (list.length > 0) {
+        branchToCommits.set(rb, list.slice(-PER_BRANCH_LIMIT));
+      }
+    } catch (e) {
+      // ignore branch errors
+    }
+  }
+
+  const shaToBranches = new Map<string, Set<string>>();
+  for (const [rb, shas] of branchToCommits) {
+    for (const sha of shas) {
+      if (!shaToBranches.has(sha)) shaToBranches.set(sha, new Set());
+      shaToBranches.get(sha)!.add(rb);
+    }
+  }
+
+  // Global view of commits roughly in order
+  let allShasOrdered: string[] = [];
+  try {
+    allShasOrdered = runGit(
+      `git log --no-merges --since="${since}" --until="${until}" --all --pretty=format:%H --reverse || true`
+    )
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } catch (e) {
+    // fallback
+  }
+
+  const seen = new Set<string>();
+  const commitShas = allShasOrdered.filter((sha) => {
+    if (seen.has(sha)) return false;
+    if (!shaToBranches.has(sha)) return false;
+    seen.add(sha);
+    return true;
+  });
+
+  if (commitShas.length === 0) {
+    console.log("📭 No valid commits found since " + since);
+    return null;
+  }
+
+  const commitMetas: CommitMeta[] = commitShas.map((sha) => {
+    const title = runGit(`git show -s --format=%s ${sha}`);
+    const author = runGit(`git show -s --format=%an ${sha}`);
+    const date = runGit(`git show -s --format=%cd --date=format:%Y-%m-%d ${sha}`);
+    // Get stats
+    let stat = "";
+    try {
+        // git show --stat --format="" returns just the stat lines
+        // For root commit, sometimes it needs --root
+        stat = runGit(`git show --stat --root --format="" ${sha}`).trim();
+    } catch (e: any) {
+        // failed to get stats
+    }
+    
+    // Fallback if empty (e.g. merge commit without conflict resolution might look empty in stat?)
+    if (!stat) stat = "(No file changes detected in stat)";
+
+    let originUrl = "";
+    try {
+      originUrl = runGit(`git remote get-url origin`);
+    } catch {}
+
+    let url = "";
+    if (originUrl.includes("github.com")) {
+      let cleanRepo = originUrl
+        .replace("git@github.com:", "")
+        .replace("https://github.com/", "")
+        .replace(".git", "");
+      url = `https://github.com/${cleanRepo}/commit/${sha}`;
+    } else {
+      url = `(local commit ${sha.slice(0, 7)})`;
+    }
+
+    const branches = Array.from(shaToBranches.get(sha) || []).sort();
+    return { sha, date, title, author, url, branches, stat };
+  });
+
+  console.log(`📝 Found ${commitMetas.length} commits to summarize...`);
+
+  // ------- Diff Handling -------
+  const FILE_EXCLUDES = [
+    ":!**/*.lock",
+    ":!**/dist/**",
+    ":!**/build/**",
+    ":!**/.next/**",
+    ":!**/.vite/**",
+    ":!**/out/**",
+    ":!**/coverage/**",
+    ":!package-lock.json",
+    ":!pnpm-lock.yaml",
+    ":!yarn.lock",
+    ":!**/*.min.*",
+    ":!**/node_modules/**",
+  ];
+
+  function getParentSha(sha: string) {
+    const line = runGit(`git rev-list --parents -n 1 ${sha} || true`);
+    const parts = line.split(" ").filter(Boolean);
+    return parts[1];
+  }
+
+  function getDiff(sha: string) {
+    const parent = getParentSha(sha);
+    const base = parent || runGit(`git hash-object -t tree /dev/null`);
+    const excludes = FILE_EXCLUDES.join(" ");
+    const diff = runGit(
+      `git diff --unified=0 --minimal ${base} ${sha} -- . ${excludes} || true`
+    );
+    return diff;
+  }
+
+  function splitPatchByFile(patch: string): string[] {
+    if (!patch) return [];
+    const parts = patch.split(/^diff --git.*$/m);
+    return parts.map((p) => p.trim()).filter(Boolean);
+  }
+
+  function chunkBySize(parts: string[], limit = DIFF_CHUNK_MAX_CHARS): string[] {
+    const out: string[] = [];
+    let buf = "";
+    for (const p of parts) {
+      const candidate = buf ? `${buf}\n\n${p}` : p;
+      if (candidate.length > limit) {
+        if (buf) out.push(buf);
+        if (p.length > limit) {
+          for (let i = 0; i < p.length; i += limit) {
+            out.push(p.slice(i, i + limit));
+          }
+          buf = "";
+        } else {
+          buf = p;
+        }
+      } else {
+        buf = candidate;
+      }
+    }
+    if (buf) out.push(buf);
+    return out;
+  }
+
+  // Helper to generate offline report
+  function generateOfflineReport(repoName: string, dateLabel: string, items: CommitMeta[]) {
+      const rows = items.map(c => {
+          const shaShort = c.sha.slice(0, 7);
+          const statCompact = c.stat ? c.stat.split('\n').pop()?.trim() || "N/A" : "N/A";
+          return `| [${shaShort}](${c.url}) | **${c.title}** | ${c.author} | ${statCompact} |`;
+      }).join("\n");
+
+      return `# ${dateLabel} 开发变更日报 (Log Based) - ${repoName}
+
+> ⚠️ **注意**：由于无法连接 AI 服务，以下内容基于原始 Git 日志生成。
+
+## 📊 今日概览
+- **提交总数**: ${items.length}
+- **涉及分支**: ${Array.from(new Set(items.flatMap(i => i.branches))).join(", ")}
+
+## 📝 提交清单
+
+| SHA | 标题 | 作者 | 变更统计 |
+|-----|------|------|----------|
+${rows}
+
+## 🔍 详细变更
+${items.map(c => `
+### ${c.title}
+- **SHA**: \`${c.sha.slice(0, 7)}\`
+- **Branch**: ${c.branches.join(", ")}
+- **Author**: ${c.author}
+- **Stats**:
+\`\`\`text
+${c.stat}
+\`\`\`
+`).join("\n---\n")}
+`;
+  }
+
+  // Initialize with any cached results
+  const perCommitFinal: { meta: CommitMeta; summary: string }[] = [...cachedResults];
+  const processedCount = cachedResults.length;
 
   for (const meta of commitMetas) {
-    console.log(`\nProcessing commit ${meta.sha.slice(0, 7)}...`);
+    // Skip if already cached
+    if (cachedShas.has(meta.sha)) {
+      continue;
+    }
+    
+    console.log(`\nProcessing commit ${meta.sha.slice(0, 7)}... (${perCommitFinal.length + 1}/${commitMetas.length})`);
     const fullPatch = getDiff(meta.sha);
 
     if (!fullPatch || !fullPatch.trim()) {
@@ -467,63 +669,248 @@ async function saveReportLocally(text: string, repoName: string) {
     const chunks = chunkBySize(fileParts, DIFF_CHUNK_MAX_CHARS);
     console.log(`   Split into ${chunks.length} chunk(s).`);
 
-    const partSummaries: string[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      //   process.stdout.write(`   Processing chunk ${i + 1}/${chunks.length}... `);
-      const prompt = commitChunkPrompt(meta, i + 1, chunks.length, chunks[i]);
-      try {
-        const sum = await chat(prompt);
-        partSummaries.push(sum || `（片段${i + 1}摘要为空）`);
-        // console.log("Done.");
-      } catch (e: any) {
-        console.error(`   ❌ Failed chunk ${i + 1}: ${String(e.message)}`);
-        partSummaries.push(`（片段${i + 1}调用失败：${String(e)}）`);
-      }
-    }
-
-    // Merge chunks
     let merged = "";
-    if (chunks.length > 1) {
-      console.log("   Merging chunks...");
-      try {
-        merged = await chat(commitMergePrompt(meta, partSummaries));
-      } catch (e: any) {
-        merged = partSummaries.join("\n\n");
-      }
+    
+    // Offline mode: skip AI, use commit title as summary
+    if (RUN_MODE === "offline" || !OPENAI_API_KEY) {
+      console.log(`   📋 Offline mode: using commit title as summary`);
+      merged = meta.title;
     } else {
-      merged = partSummaries[0] || "";
+      // Online mode: use AI
+      const partSummaries: string[] = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const prompt = commitChunkPrompt(meta, i + 1, chunks.length, chunks[i]);
+        try {
+          const sum = await chat(prompt);
+          partSummaries.push(sum || `（片段${i + 1}摘要为空）`);
+        } catch (e: any) {
+          console.error(`   ❌ Failed chunk ${i + 1}: ${String(e.message)}`);
+          partSummaries.push(`（片段${i + 1}调用失败：${String(e)}）`);
+        }
+      }
+
+      // Merge chunks
+      if (chunks.length > 1) {
+        console.log("   Merging chunks...");
+        try {
+          merged = await chat(commitMergePrompt(meta, partSummaries));
+        } catch (e: any) {
+          merged = partSummaries.join("\n\n");
+        }
+      } else {
+        merged = partSummaries[0] || "";
+      }
     }
 
     perCommitFinal.push({ meta, summary: merged });
+    
+    // Incremental save to cache after each commit
+    try {
+        const partialResult = { repoName, results: [...perCommitFinal] };
+        fs.writeFileSync(cacheFile, JSON.stringify(partialResult, null, 2), "utf8");
+    } catch (e) {
+        // Ignore save errors, continue processing
+    }
+    
+    // Also write to markdown file immediately
+    const reportsDir = path.join(process.cwd(), "reports");
+    if (!fs.existsSync(reportsDir)) {
+        fs.mkdirSync(reportsDir, { recursive: true });
+    }
+    
+    const sanitizedProjName = repoName.replace(/[\/?:*"<>|]/g, "_");
+    const [year, month] = meta.date.split("-");
+    const mdFilename = REPORT_FILENAME_FORMAT
+      .replace(/\{\{date\}\}/g, meta.date)
+      .replace(/\{\{year\}\}/g, year)
+      .replace(/\{\{month\}\}/g, month)
+      .replace(/\{\{repo\}\}/g, sanitizedProjName)
+      .replace(/\{\{owner\}\}/g, repoOwner || "unknown")
+      .replace(/\{\{author\}\}/g, meta.author.replace(/\s+/g, "_"));
+      
+    const mdPath = path.join(reportsDir, mdFilename);
+    
+    // Create header if file doesn't exist
+    if (!fs.existsSync(mdPath)) {
+        fs.writeFileSync(mdPath, `# 📅 ${meta.date} - ${repoName}\n\n`, "utf8");
+    }
+    
+    // Append this commit
+    const statShort = meta.stat ? meta.stat.split('\n').pop()?.trim() : "";
+    let entry = `## ${meta.title} (${meta.sha.slice(0,7)})\n`;
+    entry += `👤 ${meta.author}`;
+    if (statShort) entry += ` | 📊 \`${statShort}\``;
+    entry += `\n\n${merged}\n\n---\n\n`;
+    
+    fs.appendFileSync(mdPath, entry, "utf8");
+    console.log(`   📝 Appended to: ${mdFilename}`);
   }
 
   // Generate Daily Summary
-  console.log("\nGenerating final daily report...");
-  const todayLabel = new Date().toLocaleDateString("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-
-  let daily = "";
+  // We no longer generate a per-repo report here. 
+  // We return the processed commits to the main loop for consolidation.
+  
+  const finalResult = { repoName, repoOwner, results: perCommitFinal };
+  
+  // Save to cache
   try {
-    daily = await chat(dailyMergePrompt(todayLabel, perCommitFinal, REPO_NAME));
-  } catch (e: any) {
-    console.error("❌ Failed to generate daily summary:", e);
-    daily =
-      `（当日汇总失败，以下为逐提交原始小结拼接）\n\n` +
-      perCommitFinal
-        .map(
-          (it) =>
-            `[${it.meta.sha.slice(0, 7)}] ${
-              it.meta.title
-            } — ${it.meta.branches.join(", ")}\n${it.summary}`
-        )
-        .join("\n\n---\n\n");
+      fs.writeFileSync(cacheFile, JSON.stringify(finalResult, null, 2), "utf8");
+      console.log(`💾 Progress saved to cache: ${cacheFile}`);
+  } catch (e) {
+      console.error("❌ Failed to save cache:", e);
   }
 
-  await saveReportLocally(daily, REPO_NAME);
+  return finalResult;
+}
+
+// ------- Consolidation & Reporting -------
+
+async function consolidateAndSave(allData: { repoName: string; repoOwner: string; results: { meta: CommitMeta; summary: string }[] }[]) {
+  if (allData.length === 0) return;
+
+  // 1. Group by Date
+  const byDate = new Map<string, { repoName: string; repoOwner: string; items: { meta: CommitMeta; summary: string }[] }[]>();
+  
+  for (const repoData of allData) {
+      for (const item of repoData.results) {
+          const date = item.meta.date;
+          if (!byDate.has(date)) byDate.set(date, []);
+          
+          let dateGroup = byDate.get(date)!;
+          let repoGroup = dateGroup.find(g => g.repoName === repoData.repoName);
+          if (!repoGroup) {
+              repoGroup = { repoName: repoData.repoName, repoOwner: repoData.repoOwner, items: [] };
+              dateGroup.push(repoGroup);
+          }
+          repoGroup.items.push(item);
+      }
+  }
+
+  // 2. Sort Dates Descending
+  const sortedDates = Array.from(byDate.keys()).sort().reverse();
+  
+  // 3. Ensure reports directory exists
+  const reportsDir = path.join(process.cwd(), "reports");
+  if (!fs.existsSync(reportsDir)) {
+      fs.mkdirSync(reportsDir, { recursive: true });
+  }
+  
+  // 4. Generate one file per (Date, Project)
+  for (const date of sortedDates) {
+      const projects = byDate.get(date)!;
+      
+      for (const proj of projects) {
+          let markdown = `# 📅 ${date} - 📂 ${proj.repoName}\n\n`;
+          
+          // Content for this project on this day
+          for (const item of proj.items) {
+             const statShort = item.meta.stat ? item.meta.stat.split('\n').pop()?.trim() : "";
+             
+             // Commit Title as H2
+             markdown += `## 📝 ${item.meta.title} ([${item.meta.sha.slice(0,7)}](${item.meta.url})) ${item.meta.author}\n`;
+             if (statShort) markdown += `> 📊 \`${statShort}\`\n\n`;
+             
+             // Summary content
+             let sum = item.summary.replace(/^### /gm, "### "); // Keep H3
+             markdown += `${sum}\n\n---\n\n`;
+          }
+          
+          // Sanitize project name for filename
+          const sanitizedProjName = proj.repoName.replace(/[^a-zA-Z0-9-_]/g, "_");
+          const [year, month] = date.split("-");
+          // Use first author from items as representative if needed
+          const mainAuthor = proj.items[0]?.meta.author.replace(/\s+/g, "_") || "unknown";
+          
+          const filename = REPORT_FILENAME_FORMAT
+            .replace(/\{\{date\}\}/g, date)
+            .replace(/\{\{year\}\}/g, year)
+            .replace(/\{\{month\}\}/g, month)
+            .replace(/\{\{repo\}\}/g, sanitizedProjName)
+            .replace(/\{\{owner\}\}/g, proj.repoOwner || "unknown")
+            .replace(/\{\{author\}\}/g, mainAuthor);
+            
+          const filePath = path.join(reportsDir, filename);
+          
+          fs.writeFileSync(filePath, markdown, "utf8");
+          console.log(`  ✅ Saved: ${filePath}`);
+      }
+  }
+  
+  console.log(`\n✅ All reports saved to: ${reportsDir}/`);
+}
+
+// ------- Main Execution Flow -------
+(async () => {
+  const accumulatedResults: { repoName: string; repoOwner: string; results: { meta: CommitMeta; summary: string }[] }[] = [];
+
+  if (TARGET_DIR) {
+    console.log(`\n🔍 Scanning directory: ${TARGET_DIR}`);
+    console.log(`   Recursive: ${RECURSIVE_SCAN ? 'Yes' : 'No'}`);
+    console.log(`   Mode: ${RUN_MODE}`);
+    if (GIT_OWNERS.length > 0) {
+      console.log(`   Owner whitelist: ${GIT_OWNERS.join(", ")} (third-party repos will be skipped)`);
+    }
+    if (EXCLUDE_PATHS.length > 0) {
+      console.log(`   Excluded paths: ${EXCLUDE_PATHS.join(", ")}`);
+    }
+    
+    // Use the new discovery function
+    const discoveredRepos = discoverGitRepos(TARGET_DIR, RECURSIVE_SCAN, EXCLUDE_PATHS);
+    console.log(`\n📂 Found ${discoveredRepos.length} Git repositories\n`);
+    
+    // Filter out third-party repos
+    const reposToAnalyze: string[] = [];
+    for (const repoPath of discoveredRepos) {
+      const { isThirdParty, reason } = isThirdPartyRepo(repoPath, GIT_OWNERS);
+      const repoName = path.basename(repoPath);
+      if (isThirdParty) {
+        console.log(`   ⏭️  Skipping third-party: ${repoName} (${reason})`);
+      } else {
+        reposToAnalyze.push(repoPath);
+      }
+    }
+    
+    console.log(`\n✅ ${reposToAnalyze.length} repositories to analyze\n`);
+
+    const totalRepos = reposToAnalyze.length;
+    let repoIndex = 0;
+
+    for (const dir of reposToAnalyze) {
+      repoIndex++;
+      console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`📊 Repository Progress: [${repoIndex}/${totalRepos}]`);
+      try {
+        const result = await analyzeRepo(dir);
+        if (result && result.results.length > 0) {
+          accumulatedResults.push(result);
+        }
+      } catch (err) {
+        console.error(`❌ Error analyzing ${dir}:`, err);
+      }
+    }
+  } else if (SINGLE_REPO) {
+    try {
+      const result = await analyzeRepo(SINGLE_REPO);
+       if (result && result.results.length > 0) {
+          accumulatedResults.push(result);
+        }
+    } catch (err) {
+      console.error("❌ Fatal Error:", err);
+      process.exit(1);
+    }
+  } else {
+    console.error("❌ No target repository or directory specified. Use --repo <path> or --dir <path>.");
+    process.exit(1);
+  }
+
+  // Generate consolidated report
+  if (accumulatedResults.length > 0) {
+      await consolidateAndSave(accumulatedResults);
+  } else {
+      console.log("No commits found to consolidate.");
+  }
+
 })().catch((err) => {
-  console.error("❌ Fatal Error:", err);
+  console.error("❌ Fatal Error in main execution:", err);
   process.exit(1);
 });
