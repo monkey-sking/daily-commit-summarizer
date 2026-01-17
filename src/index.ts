@@ -45,6 +45,7 @@ const DIFF_CHUNK_MAX_CHARS = parseInt(
   process.env.DIFF_CHUNK_MAX_CHARS || "80000",
   10
 );
+const SYNC_CACHE_WITH_GIT = process.env.SYNC_CACHE_WITH_GIT === "true";
 
 if (!OPENAI_API_KEY) {
   console.warn("⚠️  Missing OPENAI_API_KEY in .env. AI summarization will be skipped (Offline Mode).");
@@ -202,11 +203,30 @@ function isThirdPartyRepo(repoPath: string, ownerWhitelist: string[]): { isThird
 
 // ------- AI & Prompts -------
 
-// OpenAI Client Initialization
-const client = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-  baseURL: OPENAI_BASE_URL,
-});
+// ------- API Configuration & Client Rotation -------
+const OPENAI_API_KEYS = OPENAI_API_KEY.split(",").map(k => k.trim()).filter(Boolean);
+let currentKeyIndex = 0;
+
+function getClient() {
+  const key = OPENAI_API_KEYS[currentKeyIndex] || OPENAI_API_KEY;
+  return new OpenAI({
+    apiKey: key,
+    baseURL: OPENAI_BASE_URL,
+  });
+}
+
+/**
+ * Switch to the next API key in the list
+ */
+function rotateApiKey() {
+  if (OPENAI_API_KEYS.length > 1) {
+    const oldIndex = currentKeyIndex;
+    currentKeyIndex = (currentKeyIndex + 1) % OPENAI_API_KEYS.length;
+    console.warn(`\n🔄 [Rotation] Rate limited or 503. Switching API Key: [${oldIndex + 1}/${OPENAI_API_KEYS.length}] -> [${currentKeyIndex + 1}/${OPENAI_API_KEYS.length}]`);
+    return true;
+  }
+  return false;
+}
 
 async function chat(prompt: string): Promise<string> {
   const maxRetries = 10;
@@ -214,35 +234,54 @@ async function chat(prompt: string): Promise<string> {
 
   while (attempts < maxRetries) {
       try {
-          return await new Promise(async (resolve, reject) => {
-              console.log(`   > contacting LLM...`);
-              try {
-                  const response = await client.chat.completions.create({
-                      model: MODEL_NAME,
-                      messages: [{ role: "user", content: prompt }],
-                      temperature: 0.2,
-                  });
-                  const content = response.choices[0]?.message?.content?.trim() || "";
-                  resolve(content);
-              } catch (e: any) {
-                  reject(e);
-              }
+          const currentClient = getClient();
+          console.log(`   > LLM [${MODEL_NAME}] (Attempt ${attempts + 1}, Key ${currentKeyIndex + 1}/${OPENAI_API_KEYS.length || 1})`);
+          
+          const response = await currentClient.chat.completions.create({
+              model: MODEL_NAME,
+              messages: [{ role: "user", content: prompt }],
+              temperature: 0.2,
           });
+          
+          return response.choices[0]?.message?.content?.trim() || "";
       } catch (e: any) {
           attempts++;
           const errMsg = e.message || "";
-          if (errMsg.includes("limited") && errMsg.includes("wait")) {
+          const isRateLimit = errMsg.includes("limited") || errMsg.includes("wait") || errMsg.includes("429") || errMsg.includes("503");
+
+          if (isRateLimit) {
+              console.warn(`\n🔍 [Debug] LLM Error: ${errMsg}`);
+              // Rotation first
+              if (rotateApiKey()) {
+                  console.log(`   🚀 Key rotated, retrying immediately...`);
+                  continue; 
+              }
+
+              // Special logic for gemini-3-flash as requested: no wait
+              if (MODEL_NAME === "gemini-3-flash") {
+                  console.warn(`\n⚠️  Model ${MODEL_NAME} rate limited. Retrying in 2s (bypass wait)...`);
+                  await new Promise(r => setTimeout(r, 2000));
+                  continue;
+              }
+
               const match = errMsg.match(/wait (\d+)s/);
-              const seconds = match ? parseInt(match[1], 10) : 3600;
-              console.warn(`\n⚠️  Rate limited (503). Waiting ${seconds}s before retry (Attempt ${attempts}/${maxRetries})...`);
-              // Wait requested seconds + 5s buffer
-              await new Promise(r => setTimeout(r, (seconds + 5) * 1000));
+              let seconds = match ? parseInt(match[1], 10) : 10;
+              
+              if (seconds > 30) {
+                  console.warn(`\n⚠️  Rate limited. Server asked ${seconds}s, capping to 30s...`);
+                  seconds = 30;
+              } else {
+                  console.warn(`\n⚠️  Rate limited. Waiting ${seconds}s...`);
+              }
+
+              await new Promise(r => setTimeout(r, (seconds + 1) * 1000));
               continue;
           }
+
           if (attempts >= maxRetries) throw e;
           
-          console.error(`   ❌ Chat error: ${errMsg}. Retrying in 10s...`);
-          await new Promise(r => setTimeout(r, 10000));
+          console.error(`   ❌ Chat error: ${errMsg}. Retrying in 5s...`);
+          await new Promise(r => setTimeout(r, 5000));
       }
   }
   throw new Error("Max retries exceeded");
@@ -507,6 +546,24 @@ async function analyzeRepo(repoPath: string): Promise<{ repoName: string; repoOw
     return null;
   }
 
+  // ------- Cache Sync (Pruning) -------
+  if (SYNC_CACHE_WITH_GIT && cachedResults.length > 0) {
+      const currentShasSet = new Set(commitShas);
+      const originalCount = cachedResults.length;
+      cachedResults = cachedResults.filter(r => currentShasSet.has(r.meta.sha));
+      
+      if (cachedResults.length < originalCount) {
+          console.log(`🧹 [Sync] Pruned ${originalCount - cachedResults.length} stale commits from cache.`);
+          cachedShas = new Set(cachedResults.map(r => r.meta.sha));
+          // Update cache file immediately
+          try {
+              fs.writeFileSync(cacheFile, JSON.stringify({ repoName, results: cachedResults }, null, 2), "utf8");
+          } catch (e) {
+              console.warn(`   ⚠️  Failed to save pruned cache: ${e}`);
+          }
+      }
+  }
+
   const commitMetas: CommitMeta[] = commitShas.map((sha) => {
     const title = runGit(`git show -s --format=%s ${sha}`);
     const author = runGit(`git show -s --format=%an ${sha}`);
@@ -643,25 +700,42 @@ ${c.stat}
 `;
   }
 
-  // Initialize with any cached results
-  const perCommitFinal: { meta: CommitMeta; summary: string }[] = [...cachedResults];
-  const processedCount = cachedResults.length;
+  // Create a map for fast lookup of existing summaries
+  const cachedSummaryMap = new Map<string, string>();
+  cachedResults.forEach(r => cachedSummaryMap.set(r.meta.sha, r.summary));
 
-  for (const meta of commitMetas) {
-    // Skip if already cached
-    if (cachedShas.has(meta.sha)) {
-      continue;
+  // We will rebuild the final list strictly based on Git history order (commitMetas)
+  const perCommitFinal: { meta: CommitMeta; summary: string }[] = [];
+
+  // Identify "orphaned" commits (in cache but not in current Git history)
+  // If SYNC_CACHE_WITH_GIT is TRUE, 'cachedResults' was already pruned earlier, so orphans is empty.
+  // If SYNC_CACHE_WITH_GIT is FALSE, 'cachedResults' contains everything, so we filter out current ones to find orphans.
+  const currentShasSet = new Set(commitMetas.map(m => m.sha));
+  const orphanedCommits = cachedResults.filter(r => !currentShasSet.has(r.meta.sha));
+
+  for (let i = 0; i < commitMetas.length; i++) {
+    const meta = commitMetas[i];
+
+    // If we have a valid summary in cache, use it directly
+    if (cachedSummaryMap.has(meta.sha)) {
+       perCommitFinal.push({ meta, summary: cachedSummaryMap.get(meta.sha)! });
+       continue;
     }
     
-    console.log(`\nProcessing commit ${meta.sha.slice(0, 7)}... (${perCommitFinal.length + 1}/${commitMetas.length})`);
+    console.log(`\nProcessing commit ${meta.sha.slice(0, 7)}... (${i + 1}/${commitMetas.length})`);
     const fullPatch = getDiff(meta.sha);
 
     if (!fullPatch || !fullPatch.trim()) {
       console.log("   (Skipping: trivial or excluded files)");
-      perCommitFinal.push({
-        meta,
-        summary: `（无有效业务改动或改动已被过滤，例如 lockfile/构建产物/二进制，或空提交）`,
-      });
+      const summary = `（无有效业务改动或改动已被过滤，例如 lockfile/构建产物/二进制，或空提交）`;
+      perCommitFinal.push({ meta, summary });
+      
+      // Save trivial commit to cache immediately
+      try {
+          const partialResult = { repoName, results: [...perCommitFinal] };
+          fs.writeFileSync(cacheFile, JSON.stringify(partialResult, null, 2), "utf8");
+      } catch (e) { /* ignore */ }
+      
       continue;
     }
 
@@ -706,7 +780,9 @@ ${c.stat}
     
     // Incremental save to cache after each commit
     try {
-        const partialResult = { repoName, results: [...perCommitFinal] };
+        // Save: Valid Current Commits + Orphans (if any)
+        const combinedResults = [...perCommitFinal, ...orphanedCommits];
+        const partialResult = { repoName, results: combinedResults };
         fs.writeFileSync(cacheFile, JSON.stringify(partialResult, null, 2), "utf8");
     } catch (e) {
         // Ignore save errors, continue processing
@@ -816,7 +892,7 @@ async function consolidateAndSave(allData: { repoName: string; repoOwner: string
           }
           
           // Sanitize project name for filename
-          const sanitizedProjName = proj.repoName.replace(/[^a-zA-Z0-9-_]/g, "_");
+          const sanitizedProjName = proj.repoName.replace(/[\/?:*"<>|]/g, "_");
           const [year, month] = date.split("-");
           // Use first author from items as representative if needed
           const mainAuthor = proj.items[0]?.meta.author.replace(/\s+/g, "_") || "unknown";
