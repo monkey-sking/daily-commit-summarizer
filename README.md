@@ -99,11 +99,13 @@ npx tsx src/index.ts --dir /path/to/projects --recursive
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `OPENAI_API_KEY` | OpenAI API 密钥 | `sk-xxx` |
-| `OPENAI_BASE_URL` | API 端点地址 | `https://api.openai.com` |
-| `GIT_OWNERS` | 仓库 Owner 白名单（逗号分隔） | `my-username,my-org` |
+| `OPENAI_API_KEY` | OpenAI API key (supports multiple keys comma-separated) | `sk-key1,sk-key2` |
+| `OPENAI_BASE_URL` | API endpoint (e.g. `http://localhost:8000/v1`) | `https://api.openai.com` |
+| `GIT_OWNERS` | Owner whitelist (comma-separated) | `my-username,my-org` |
 | `RUN_MODE` | `online`（使用 AI）或 `offline`（仅 git log） | `online` |
-| `PROMPTS_FILE` | 自定义 Prompt 模板文件路径 | `prompts.json` |
+| `MODEL_NAME` | LLM Model Name | `gpt-4.1-mini` |
+| `SYNC_CACHE_WITH_GIT` | Prune cache entries deleted from Git history | `false` |
+| `PROMPTS_FILE` | Custom Prompt 模板文件路径 | `prompts.json` |
 | `REPORT_FILENAME_FORMAT` | 报告文件名以模版格式 | `{{date}}_{{repo}}.md` |
 
 ### 文件名模版变量
@@ -146,6 +148,9 @@ npx tsx src/index.ts --dir /path --recursive --owners my-username,my-org
 - ✅ **离线模式** - 无需 AI 即可生成报告
 - ✅ **断点续传** - 缓存已处理的提交，支持中断恢复
 - ✅ **实时输出** - Markdown 报告增量生成
+- ✅ **多 Key 轮询** - 支持配置多个 API Key 自动切换，突破速率限制
+- ✅ **Git 同步模式** - 支持自动清理缓存中的失效提交 (`SYNC_CACHE_WITH_GIT`)
+- ✅ **中文支持** - 完美支持中文项目路径和文件名
 
 ---
 
