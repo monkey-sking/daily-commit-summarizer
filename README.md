@@ -1,5 +1,9 @@
 # Daily Commit Summarizer
 
+<!-- badges:start -->
+[![License](https://img.shields.io/github/license/monkey-sking/daily-commit-summarizer?style=flat-square)](https://github.com/monkey-sking/daily-commit-summarizer/blob/main/LICENSE) [![Last commit](https://img.shields.io/github/last-commit/monkey-sking/daily-commit-summarizer?style=flat-square)](https://github.com/monkey-sking/daily-commit-summarizer/commits/main) [![TypeScript](https://img.shields.io/github/languages/top/monkey-sking/daily-commit-summarizer?style=flat-square)](https://github.com/monkey-sking/daily-commit-summarizer/search?l=TypeScript) [![views](https://hits.sh/github.com/monkey-sking/daily-commit-summarizer.svg?style=flat-square&label=views&color=0e75b6)](https://github.com/monkey-sking/daily-commit-summarizer)
+<!-- badges:end -->
+
 [English](#english) | [中文](#中文)
 
 ---
